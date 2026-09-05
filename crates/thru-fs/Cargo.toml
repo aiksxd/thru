@@ -1,0 +1,8 @@
+﻿[package]
+name = "thru-fs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thru-core = { path = "../thru-core" }
+thru-transport = { path = "../thru-transport" }
