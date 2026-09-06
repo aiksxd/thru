@@ -1,0 +1,277 @@
+Read "D:\SharedWorkshop\thru\crates\thru-exec\src\lib.rs":
+
+     1	﻿use std::fs;
+     2	use std::io::{self, Read, Write};
+     3	use std::process::Command;
+     4	use std::thread;
+     5	use thru_core::{read_frame, write_frame};
+     6	use thru_transport::Connection;
+     7	use portable_pty::{
+     8	    Child, CommandBuilder, ExitStatus, MasterPty, NativePtySystem, PtySize, PtySystem,
+     9	};
+    10	
+    11	// Operation codes (30-39 reserved for exec/pty)
+    12	pub const OP_SHELL_OPEN: u8 = 30;
+    13	pub const OP_RESIZE: u8 = 31;
+    14	pub const OP_EXEC_SCRIPT: u8 = 32;
+    15	
+    16	// Status codes (shared convention)
+    17	pub const ST_OK: u8 = 0;
+    18	pub const ST_ERR: u8 = 2;
+    19	
+    20	// --- shell resolution: inherit the environment that started thru ---
+    21	
+    22	/// Resolve the shell to spawn: THRU_SHELL > platform default.
+    23	/// Unix: $SHELL or /bin/sh; Windows: %COMSPEC% (cmd.exe).
+    24	pub fn default_shell() -> String {
+    25	    if let Ok(s) = std::env::var("THRU_SHELL") {
+    26	        if !s.is_empty() {
+    27	            return s;
+    28	        }
+    29	    }
+    30	    if cfg!(unix) {
+    31	        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    32	    } else {
+    33	        // Windows: default to %COMSPEC% (cmd.exe) for predictable script behavior.
+    34	        // PowerShell can be selected via THRU_SHELL=powershell.exe.
+    35	        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+    36	    }
+    37	}
+    38	
+    39	// --- PTY session ---
+    40	
+    41	/// A live PTY session: master pty + child shell + split reader/writer.
+    42	pub struct PtySession {
+    43	    master: Box<dyn MasterPty>,
+    44	    child: Box<dyn Child>,
+    45	    reader: Option<Box<dyn Read + Send>>,
+    46	    writer: Option<Box<dyn Write + Send>>,
+    47	}
+    48	
+    49	impl PtySession {
+    50	    /// Create a PTY and spawn the inherited shell at the current working directory.
+    51	    pub fn new(cols: u16, rows: u16) -> io::Result<Self> {
+    52	        let pty_system = NativePtySystem::default();
+    53	        let pair = pty_system
+    54	            .openpty(PtySize {
+    55	                rows,
+    56	                cols,
+    57	                pixel_width: 0,
+    58	                pixel_height: 0,
+    59	            })
+    60	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    61	        let shell = default_shell();
+    62	        let mut cmd = CommandBuilder::new(&shell);
+    63	        // Inherit the working directory of the thru process.
+    64	        if let Ok(cwd) = std::env::current_dir() {
+    65	            cmd.cwd(cwd);
+    66	        }
+    67	        // Environment variables are inherited by default.
+    68	        let child = pair
+    69	            .slave
+    70	            .spawn_command(cmd)
+    71	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    72	        let reader = pair
+    73	            .master
+    74	            .try_clone_reader()
+    75	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    76	        let writer = pair
+    77	            .master
+    78	            .take_writer()
+    79	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    80	        Ok(Self {
+    81	            master: pair.master,
+    82	            child,
+    83	            reader: Some(reader),
+    84	            writer: Some(writer),
+    85	        })
+    86	    }
+    87	
+    88	    pub fn take_reader(&mut self) -> Option<Box<dyn Read + Send>> {
+    89	        self.reader.take()
+    90	    }
+    91	
+    92	    pub fn take_writer(&mut self) -> Option<Box<dyn Write + Send>> {
+    93	        self.writer.take()
+    94	    }
+    95	
+    96	    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+    97	        self.master
+    98	            .resize(PtySize {
+    99	                rows,
+   100	                cols,
+   101	                pixel_width: 0,
+   102	                pixel_height: 0,
+   103	            })
+   104	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+   105	    }
+   106	
+   107	    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+   108	        self.child
+   109	            .try_wait()
+   110	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+   111	    }
+   112	
+   113	    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+   114	        self.child
+   115	            .wait()
+   116	            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+   117	    }
+   118	}
+   119	
+   120	// --- wire helpers ---
+   121	
+   122	fn parse_size(data: &[u8]) -> io::Result<(u16, u16)> {
+   123	    if data.len() < 5 {
+   124	        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated size"));
+   125	    }
+   126	    let cols = u16::from_be_bytes([data[1], data[2]]);
+   127	    let rows = u16::from_be_bytes([data[3], data[4]]);
+   128	    Ok((cols, rows))
+   129	}
+   130	
+   131	// --- server-side handlers ---
+   132	
+   133	/// Interactive PTY shell: SHELL_OPEN then bidirectional raw byte stream.
+   134	/// RESIZE frames (op 31) are intercepted; all other frames are keystrokes.
+   135	/// Empty frame from client = disconnect.
+   136	pub fn handle_shell_open(conn: &mut Box<dyn Connection>, data: &[u8]) -> io::Result<()> {
+   137	    let (cols, rows) = parse_size(data)?;
+   138	    let mut session = PtySession::new(cols, rows)?;
+   139	
+   140	    // PTY output -> client frames (own thread).
+   141	    let mut out_conn = conn.try_clone()?;
+   142	    let mut pty_reader = session
+   143	        .take_reader()
+   144	        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no pty reader"))?;
+   145	    let reader_handle = thread::spawn(move || {
+   146	        let mut buf = [0u8; 8192];
+   147	        loop {
+   148	            match pty_reader.read(&mut buf) {
+   149	                Ok(0) => break,
+   150	                Ok(n) => {
+   151	                    if write_frame(&mut out_conn, &buf[..n]).is_err() {
+   152	                        break;
+   153	                    }
+   154	                }
+   155	                Err(_) => break,
+   156	            }
+   157	        }
+   158	    });
+   159	
+   160	    // Client frames -> PTY input (or RESIZE handling).
+   161	    let mut pty_writer = session
+   162	        .take_writer()
+   163	        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no pty writer"))?;
+   164	    loop {
+   165	        if session.try_wait()?.is_some() {
+   166	            break;
+   167	        }
+   168	        match read_frame(conn) {
+   169	            Ok(frame) => {
+   170	                if frame.is_empty() {
+   171	                    break; // client requested disconnect
+   172	                }
+   173	                if frame[0] == OP_RESIZE {
+   174	                    if let Ok((c, r)) = parse_size(&frame) {
+   175	                        let _ = session.resize(c, r);
+   176	                    }
+   177	                } else {
+   178	                    pty_writer.write_all(&frame)?;
+   179	                    pty_writer.flush()?;
+   180	                }
+   181	            }
+   182	            Err(_) => break,
+   183	        }
+   184	    }
+   185	
+   186	    let _ = reader_handle.join();
+   187	    Ok(())
+   188	}
+   189	
+   190	/// Non-interactive script execution.
+   191	/// Uses std::process::Command (not PTY) for reliability:
+   192	///   Unix:    <user-shell> -e -c "script"  (set -e = abort on first error; shell from THRU_SHELL/$SHELL)
+   193	///   Windows: temp .bat with `if errorlevel 1 exit` after each command
+   194	/// Streams stdout+stderr back; final non-empty frame is the i32 exit code.
+   195	pub fn handle_exec_script(conn: &mut Box<dyn Connection>, data: &[u8]) -> io::Result<()> {
+   196	    if data.len() < 5 {
+   197	        return write_frame(conn, &[ST_ERR]);
+   198	    }
+   199	    let script_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+   200	    if data.len() < 5 + script_len {
+   201	        return write_frame(conn, &[ST_ERR]);
+   202	    }
+   203	    let script = String::from_utf8_lossy(&data[5..5 + script_len]).to_string();
+   204	
+   205	    let output = if cfg!(unix) {
+   206	        // Use the user's resolved shell (THRU_SHELL > $SHELL > /bin/sh)
+   207	        // instead of hardcoding sh, so zsh/bash builtins and aliases work.
+   208	        let shell = default_shell();
+   209	        Command::new(&shell)
+   210	            .arg("-e")
+   211	            .arg("-c")
+   212	            .arg(&script)
+   213	            .output()?
+   214	    } else {
+   215	        // Windows: write a temp .bat with error-abort after each command.
+   216	        let bat_path = std::env::temp_dir().join(format!("thru_exec_{}.bat", std::process::id()));
+   217	        let mut bat = String::from("@echo off\r\n");
+   218	        for line in script.lines() {
+   219	            if !line.trim().is_empty() {
+   220	                bat.push_str(line);
+   221	                bat.push_str("\r\nif errorlevel 1 exit\r\n");
+   222	            }
+   223	        }
+   224	        fs::write(&bat_path, bat)?;
+   225	        let out = Command::new("cmd.exe")
+   226	            .arg("/Q")
+   227	            .arg("/C")
+   228	            .arg(&bat_path)
+   229	            .output()?;
+   230	        let _ = fs::remove_file(&bat_path);
+   231	        out
+   232	    };
+   233	
+   234	    // Stream stdout then stderr as output frames.
+   235	    if !output.stdout.is_empty() {
+   236	        write_frame(conn, &output.stdout)?;
+   237	    }
+   238	    if !output.stderr.is_empty() {
+   239	        write_frame(conn, &output.stderr)?;
+   240	    }
+   241	
+   242	    let code = output.status.code().unwrap_or(1);
+   243	    // Final frame: i32 exit code (big-endian).
+   244	    write_frame(conn, &(code as i32).to_be_bytes())?;
+   245	    write_frame(conn, &[]) // terminator
+   246	}
+   247	
+   248	// --- client-side helpers ---
+   249	
+   250	/// Execute a script on an existing connection; returns (combined_output, exit_code).
+   251	pub fn exec_script_on_conn(conn: &mut Box<dyn Connection>, script: &str) -> io::Result<(String, i32)> {
+   252	    let mut frame = vec![OP_EXEC_SCRIPT];
+   253	    frame.extend_from_slice(&(script.len() as u32).to_be_bytes());
+   254	    frame.extend_from_slice(script.as_bytes());
+   255	    write_frame(conn, &frame)?;
+   256	
+   257	    let mut frames: Vec<Vec<u8>> = Vec::new();
+   258	    loop {
+   259	        let f = read_frame(conn)?;
+   260	        if f.is_empty() { break; }
+   261	        frames.push(f);
+   262	    }
+   263	
+   264	    let exit_code = if let Some(last) = frames.last() {
+   265	        if last.len() == 4 {
+   266	            i32::from_be_bytes([last[0], last[1], last[2], last[3]])
+   267	        } else { 1 }
+   268	    } else { 1 };
+   269	
+   270	    let mut output = Vec::new();
+   271	    for f in &frames[..frames.len().saturating_sub(1)] {
+   272	        output.extend_from_slice(f);
+   273	    }
+   274	    Ok((String::from_utf8_lossy(&output).to_string(), exit_code))
+   275	}

@@ -13,9 +13,8 @@ pub const OP_SHELL_OPEN: u8 = 30;
 pub const OP_RESIZE: u8 = 31;
 pub const OP_EXEC_SCRIPT: u8 = 32;
 
-// Status codes (shared convention)
-pub const ST_OK: u8 = 0;
-pub const ST_ERR: u8 = 2;
+// Status codes (re-exported from thru-core)
+pub use thru_core::{ST_ERR, ST_OK};
 
 // --- shell resolution: inherit the environment that started thru ---
 
@@ -38,6 +37,11 @@ pub fn default_shell() -> String {
 
 // --- PTY session ---
 
+/// Build a PtySize with zero pixel dimensions (the common case).
+fn pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
+}
+
 /// A live PTY session: master pty + child shell + split reader/writer.
 pub struct PtySession {
     master: Box<dyn MasterPty>,
@@ -51,12 +55,7 @@ impl PtySession {
     pub fn new(cols: u16, rows: u16) -> io::Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(pty_size(rows, cols))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let shell = default_shell();
         let mut cmd = CommandBuilder::new(&shell);
@@ -95,12 +94,7 @@ impl PtySession {
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .resize(pty_size(rows, cols))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 
@@ -213,7 +207,11 @@ pub fn handle_exec_script(conn: &mut Box<dyn Connection>, data: &[u8]) -> io::Re
             .output()?
     } else {
         // Windows: write a temp .bat with error-abort after each command.
-        let bat_path = std::env::temp_dir().join(format!("thru_exec_{}.bat", std::process::id()));
+        // Use PID + monotonic counter for uniqueness (concurrent exec_script calls
+        // in the same process would otherwise overwrite each other's .bat file).
+        static BAT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = BAT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let bat_path = std::env::temp_dir().join(format!("thru_exec_{}_{}.bat", std::process::id(), counter));
         let mut bat = String::from("@echo off\r\n");
         for line in script.lines() {
             if !line.trim().is_empty() {
@@ -222,12 +220,17 @@ pub fn handle_exec_script(conn: &mut Box<dyn Connection>, data: &[u8]) -> io::Re
             }
         }
         fs::write(&bat_path, bat)?;
+        // RAII guard ensures the temp .bat is removed even if Command::output panics.
+        struct BatGuard(std::path::PathBuf);
+        impl Drop for BatGuard {
+            fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        }
+        let _guard = BatGuard(bat_path.clone());
         let out = Command::new("cmd.exe")
             .arg("/Q")
             .arg("/C")
             .arg(&bat_path)
             .output()?;
-        let _ = fs::remove_file(&bat_path);
         out
     };
 

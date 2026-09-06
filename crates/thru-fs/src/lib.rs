@@ -1,16 +1,14 @@
 ﻿use std::fs;
 use std::io::{self, Read, Write};
-use thru_core::{read_frame, write_frame};
+use thru_core::{read_frame, write_frame, BufExt};
 use thru_transport::{connect, Connection, Transport};
 
 // Operation codes (20-29 reserved for fs)
 pub const OP_LS: u8 = 20;
 pub const OP_GET: u8 = 21;
 
-// Status codes (shared convention with thru-dict)
-pub const ST_OK: u8 = 0;
-pub const ST_NOT_FOUND: u8 = 1;
-pub const ST_ERR: u8 = 2;
+// Status codes (re-exported from thru-core)
+pub use thru_core::{ST_ERR, ST_NOT_FOUND, ST_OK};
 
 // Entry type tags in LS response payload
 pub const ET_FILE: u8 = 0;
@@ -29,16 +27,16 @@ pub struct FsEntry {
 // --- wire format helpers ---
 
 /// Encode a request: [op][u16 path_len][path]
-fn req(op: u8, path: &[u8]) -> Vec<u8> {
+pub fn req(op: u8, path: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(3 + path.len());
     v.push(op);
-    v.extend_from_slice(&(path.len() as u16).to_be_bytes());
+    v.push_u16(path.len() as u16);
     v.extend_from_slice(path);
     v
 }
 
 /// Decode the path from a request frame.
-fn parse_path(data: &[u8]) -> io::Result<&str> {
+pub fn parse_path(data: &[u8]) -> io::Result<&str> {
     if data.len() < 3 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated request"));
     }
@@ -60,6 +58,7 @@ fn resp_err(msg: &str) -> Vec<u8> {
 
 /// Handle an fs request frame.
 /// GET is streaming: writes a header frame, then N data frames, then an empty terminator.
+/// No path restriction: the caller has full access to the filesystem visible to the process.
 pub fn handle(conn: &mut Box<dyn Connection>, data: &[u8]) -> io::Result<()> {
     if data.is_empty() {
         return write_frame(conn, &resp_err("empty request"));
@@ -87,8 +86,7 @@ fn handle_ls(conn: &mut Box<dyn Connection>, path: &str) -> io::Result<()> {
         let name = e.file_name().to_string_lossy().to_string();
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
         payload.push(if is_dir { ET_DIR } else { ET_FILE });
-        payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        payload.extend_from_slice(name.as_bytes());
+        payload.push_str(&name);
     }
     write_frame(conn, &payload)
 }
@@ -104,7 +102,7 @@ fn handle_get(conn: &mut Box<dyn Connection>, path: &str) -> io::Result<()> {
     let size = f.metadata()?.len();
     // Header frame: [ST_OK][u64 size]
     let mut head = vec![ST_OK];
-    head.extend_from_slice(&size.to_be_bytes());
+    head.push_u64(size);
     write_frame(conn, &head)?;
     // Streaming data frames
     let mut buf = vec![0u8; CHUNK];
@@ -151,6 +149,17 @@ fn check_status(first: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Parse the u64 file size from a GET response header frame: [ST_OK][u64 size].
+fn parse_size_header(frame: &[u8]) -> io::Result<u64> {
+    if frame.len() < 9 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated size header"));
+    }
+    Ok(u64::from_be_bytes([
+        frame[1], frame[2], frame[3], frame[4],
+        frame[5], frame[6], frame[7], frame[8],
+    ]))
+}
+
 /// List a remote directory on an existing connection.
 pub fn ls_on_conn(conn: &mut Box<dyn Connection>, path: &str) -> io::Result<Vec<FsEntry>> {
     let first = call_on_conn(conn, &req(OP_LS, path.as_bytes()))?;
@@ -177,13 +186,7 @@ pub fn get_on_conn<W: Write>(
 ) -> io::Result<u64> {
     let first = call_on_conn(conn, &req(OP_GET, remote.as_bytes()))?;
     check_status(&first)?;
-    if first.len() < 9 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated size header"));
-    }
-    let size = u64::from_be_bytes([
-        first[1], first[2], first[3], first[4],
-        first[5], first[6], first[7], first[8],
-    ]);
+    let size = parse_size_header(&first)?;
     loop {
         let chunk = read_frame(conn)?;
         if chunk.is_empty() { break; }
@@ -218,13 +221,7 @@ pub fn client_get_progress<W: Write, F: FnMut(u64, u64)>(
 ) -> io::Result<u64> {
     let (mut c, first) = call(t, addr, &req(OP_GET, remote.as_bytes()))?;
     check_status(&first)?;
-    if first.len() < 9 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated size header"));
-    }
-    let size = u64::from_be_bytes([
-        first[1], first[2], first[3], first[4],
-        first[5], first[6], first[7], first[8],
-    ]);
+    let size = parse_size_header(&first)?;
     // Read data frames until the empty terminator
     let mut received = 0u64;
     loop {
