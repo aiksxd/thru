@@ -144,14 +144,21 @@ pub(crate) fn auth_server(conn: &mut Box<dyn Connection>, password: Option<&str>
             let expected_hash = compute_auth_hash(pw, &nonce);
             if constant_time_eq(client_hash, &expected_hash) {
                 write_frame(conn, &[AUTH_OK])?;
+                conn.flush()?;
                 Ok(true)
             } else {
                 write_frame(conn, &[AUTH_FAIL])?;
+                conn.flush()?;
                 Ok(false)
             }
         }
         None => {
             write_frame(conn, &[AUTH_NONE])?;
+            // Explicit flush ensures the single-byte AUTH_NONE frame is pushed
+            // to the kernel immediately. Without this, small frames may be
+            // delayed by Nagle's algorithm or tunnel buffering (e.g. frp),
+            // causing the client's read_exact to hit EOF with UnexpectedEof.
+            conn.flush()?;
             Ok(true)
         }
     }

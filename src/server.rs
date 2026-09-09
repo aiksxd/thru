@@ -39,14 +39,26 @@ pub(crate) fn transport(p: &str) -> Box<dyn Transport> {
 
 /// Spawn a detached child process that re-runs the current executable with
 /// the given args and an environment variable set.
-pub(crate) fn spawn_daemon(args: &[String], env_key: &str, env_val: &str) -> io::Result<u32> {
+/// If `log_file` is Some, stdout/stderr are redirected to that file (append mode);
+/// otherwise they are redirected to null (default daemon behavior).
+pub(crate) fn spawn_daemon(args: &[String], env_key: &str, env_val: &str, log_file: Option<&str>) -> io::Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.args(args)
         .env(env_key, env_val)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+
+    if let Some(path) = log_file {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        cmd.stdout(f.try_clone()?)
+            .stderr(f);
+    } else {
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
 
     #[cfg(windows)]
     {
@@ -93,12 +105,39 @@ pub(crate) fn server_cmd(args: &[String]) -> io::Result<()> {
         }
     }
 
-    let port = args.iter().find(|a| !a.starts_with('-') && a.as_str() != "-p")
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(PORT);
+    let mut port = PORT;
+    let mut password: Option<String> = None;
+    let mut log_file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-p" && i + 1 < args.len() {
+            password = Some(args[i + 1].clone());
+            i += 2;
+        } else if (a == "-l" || a == "--log") && i + 1 < args.len() {
+            log_file = Some(args[i + 1].clone());
+            i += 2;
+        } else if (a == "-m" || a == "--max-devices") && i + 1 < args.len() {
+            i += 2; // consumed by run_server; skip here
+        } else if a.starts_with('-') {
+            eprintln!("unknown server option: '{a}' (expected -p, -l, -m, or a port number)");
+            exit(1);
+        } else {
+            port = a.parse().unwrap_or(PORT);
+            i += 1;
+        }
+    }
 
-    let pid = spawn_daemon(args, "THRU_DAEMON", "1")?;
+    let pid = spawn_daemon(args, "THRU_DAEMON", "1", log_file.as_deref())?;
     fs::write(&pf, pid.to_string())?;
+
+    // Auto-cache local session so subsequent commands (fetch2, dict, etc.)
+    // connect to this server without needing --connect or a prior reverse connect.
+    let local_addr = format!("127.0.0.1:{port}");
+    if let Err(e) = crate::auth::save_session(&local_addr, password.as_deref()) {
+        eprintln!("warning: could not cache session: {e}");
+    }
+
     println!("thru server started on port {port} (pid {pid})");
     std::process::exit(0);
 }
@@ -113,6 +152,8 @@ fn run_server(args: &[String]) -> io::Result<()> {
         if a == "-p" && i + 1 < args.len() {
             password = Some(args[i + 1].clone());
             i += 2;
+        } else if (a == "-l" || a == "--log") && i + 1 < args.len() {
+            i += 2; // consumed by parent process for daemon redirection; ignore here
         } else if (a == "-m" || a == "--max-devices") && i + 1 < args.len() {
             max_devices = args[i + 1].parse().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput,

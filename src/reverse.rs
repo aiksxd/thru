@@ -382,10 +382,15 @@ pub(crate) fn connect_cmd(args: &[String]) -> io::Result<()> {
     let addr = match rest.iter().find(|a| a.contains(':')) {
         Some(a) => a.clone(),
         None => {
-            eprintln!("usage: thru <host:port> [-p password]");
+            eprintln!("usage: thru <host:port> [-p password] [-l logfile]");
             exit(1);
         }
     };
+
+    // Extract -l/--log from args (parse_password strips -p but leaves -l)
+    let log_file = args.windows(2).find_map(|w| {
+        if w[0] == "-l" || w[0] == "--log" { Some(w[1].clone()) } else { None }
+    });
 
     let rpf = reverse_pid_file();
     if rpf.exists() {
@@ -416,7 +421,7 @@ pub(crate) fn connect_cmd(args: &[String]) -> io::Result<()> {
     };
     drop(conn);
 
-    let pid = spawn_daemon(args, "THRU_REVERSE_DAEMON", "1")?;
+    let pid = spawn_daemon(args, "THRU_REVERSE_DAEMON", "1", log_file.as_deref())?;
     fs::write(&rpf, pid.to_string())?;
     println!("{status_line}");
     println!("reverse connection established (pid {pid}) — server can now pull files from this machine");
